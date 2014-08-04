@@ -233,10 +233,6 @@ _OPTS = [
                 help='Do not handle authorization requests within the'
                 ' middleware, but delegate the authorization decision to'
                 ' downstream WSGI components'),
-    cfg.BoolOpt('http_connect_timeout',
-                default=None,
-                help='Request timeout value for communicating with Identity'
-                ' API server.'),
     cfg.IntOpt('http_request_max_retries',
                default=3,
                help='How many times are we trying to reconnect when'
@@ -261,14 +257,6 @@ _OPTS = [
     cfg.StrOpt('cache',
                default=None,
                help='Env key for the swift cache'),
-    cfg.StrOpt('certfile',
-               help='Required if Keystone server requires client certificate'),
-    cfg.StrOpt('keyfile',
-               help='Required if Keystone server requires client certificate'),
-    cfg.StrOpt('cafile', default=None,
-               help='A PEM encoded Certificate Authority to use when '
-                    'verifying HTTPs connections. Defaults to system CAs.'),
-    cfg.BoolOpt('insecure', default=False, help='Verify HTTPS connections.'),
     cfg.StrOpt('signing_dir',
                help='Directory used to cache files related to PKI tokens'),
     cfg.ListOpt('memcached_servers',
@@ -334,8 +322,14 @@ _OPTS = [
                 ' should be set to a single value for better performance.'),
 ]
 
+_AUTHTOKEN_GROUP = 'keystone_authtoken'
+_http_connect_timeout = cfg.DeprecatedOpt('http_connect_timeout',
+                                          group=_AUTHTOKEN_GROUP)
+_deprecated = {'timeout': [_http_connect_timeout]}
+_OPTS.extend(session.Session.get_conf_options(deprecated_opts=_deprecated))
+
 CONF = cfg.CONF
-CONF.register_opts(_OPTS, group='keystone_authtoken')
+CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
 
 _LIST_OF_VERSIONS_TO_ATTEMPT = ['v3.0', 'v2.0']
 
@@ -1011,13 +1005,8 @@ class AuthProtocol(object):
     # NOTE(hrybacki): This and subsequent factory functions are part of a
     # cleanup and better organization effort of AuthProtocol.
     def _session_factory(self):
-        sess = session.Session.construct(dict(
-            cert=self._conf_get('certfile'),
-            key=self._conf_get('keyfile'),
-            cacert=self._conf_get('cafile'),
-            insecure=self._conf_get('insecure'),
-            timeout=self._conf_get('http_connect_timeout')
-        ))
+        sess = session.Session.load_from_conf_options(CONF, _AUTHTOKEN_GROUP)
+
         # FIXME(jamielennox): Yes. This is wrong. We should be determining the
         # plugin to use based on a combination of discovery and inputs. Much
         # of this can be changed when we get keystoneclient 0.10. For now this

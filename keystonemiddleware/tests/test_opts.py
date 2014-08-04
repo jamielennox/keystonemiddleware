@@ -36,7 +36,6 @@ class OptsTestCase(utils.TestCase):
             'identity_uri',
             'auth_version',
             'delay_auth_decision',
-            'http_connect_timeout',
             'http_request_max_retries',
             'admin_token',
             'admin_user',
@@ -50,6 +49,7 @@ class OptsTestCase(utils.TestCase):
             'signing_dir',
             'memcached_servers',
             'token_cache_time',
+            'timeout',
             'revocation_cache_time',
             'memcache_security_strategy',
             'memcache_secret_key',
@@ -58,6 +58,7 @@ class OptsTestCase(utils.TestCase):
             'check_revocations_for_cached',
             'hash_algorithms'
         ]
+
         opt_names = [o.name for (g, l) in result for o in l]
         self.assertThat(opt_names, matchers.HasLength(len(expected_opt_names)))
 

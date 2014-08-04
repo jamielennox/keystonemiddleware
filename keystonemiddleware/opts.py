@@ -18,11 +18,11 @@ __all__ = [
 
 import copy
 
-import keystonemiddleware.auth_token
+from keystonemiddleware import auth_token
 
 
 auth_token_opts = [
-    ('keystone_authtoken', keystonemiddleware.auth_token._OPTS)
+    (auth_token._AUTHTOKEN_GROUP, auth_token._OPTS)
 ]
 
 
