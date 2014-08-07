@@ -328,10 +328,10 @@ _http_connect_timeout = cfg.DeprecatedOpt('http_connect_timeout',
                                           group=_AUTHTOKEN_GROUP)
 _deprecated = {'timeout': [_http_connect_timeout]}
 _OPTS.extend(session.Session.get_conf_options(deprecated_opts=_deprecated))
-_OPTS.extend(auth.get_common_conf_options())
 
 CONF = cfg.CONF
 CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
+auth.register_conf_options(CONF, _AUTHTOKEN_GROUP)
 
 _LIST_OF_VERSIONS_TO_ATTEMPT = ['v3.0', 'v2.0']
 

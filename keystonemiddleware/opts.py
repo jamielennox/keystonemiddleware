@@ -16,14 +16,9 @@ __all__ = [
     'list_auth_token_opts',
 ]
 
-import copy
+from keystoneclient import auth
 
 from keystonemiddleware import auth_token
-
-
-auth_token_opts = [
-    (auth_token._AUTHTOKEN_GROUP, auth_token._OPTS)
-]
 
 
 def list_auth_token_opts():
@@ -46,4 +41,7 @@ def list_auth_token_opts():
 
     :returns: a list of (group_name, opts) tuples
     """
-    return [(g, copy.deepcopy(o)) for g, o in auth_token_opts]
+    auth_token_opts = auth_token._OPTS
+    auth_plugin_opts = auth.get_common_conf_options()
+
+    return [(auth_token._AUTHTOKEN_GROUP, auth_token_opts + auth_plugin_opts)]
