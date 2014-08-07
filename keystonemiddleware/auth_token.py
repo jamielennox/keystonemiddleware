@@ -154,6 +154,7 @@ import tempfile
 import time
 
 from keystoneclient import access
+from keystoneclient import auth
 from keystoneclient.auth.identity import v2
 from keystoneclient.auth import token_endpoint
 from keystoneclient.common import cms
@@ -327,6 +328,7 @@ _http_connect_timeout = cfg.DeprecatedOpt('http_connect_timeout',
                                           group=_AUTHTOKEN_GROUP)
 _deprecated = {'timeout': [_http_connect_timeout]}
 _OPTS.extend(session.Session.get_conf_options(deprecated_opts=_deprecated))
+_OPTS.extend(auth.get_common_conf_options())
 
 CONF = cfg.CONF
 CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
@@ -1005,28 +1007,46 @@ class AuthProtocol(object):
     # NOTE(hrybacki): This and subsequent factory functions are part of a
     # cleanup and better organization effort of AuthProtocol.
     def _session_factory(self):
-        sess = session.Session.load_from_conf_options(CONF, _AUTHTOKEN_GROUP)
+        try:
+            auth_plugin = auth.load_from_conf_options(CONF, _AUTHTOKEN_GROUP)
+        except exceptions.NoMatchingPlugin:
+            # FIXME(jamielennox): I screwed up here. The error raised if no
+            # plugin is specified is the same as the one for if a plugin is
+            # specified but it couldn't be found. We should handle those cases
+            # differently, as nothing specified means fallback to default where
+            # incorrect means failure. Work around it for the mean time.
+            group = _AUTHTOKEN_GROUP
+            if CONF[group].auth_section:
+                group = conf[group].auth_section
+            if CONF[group].auth_plugin:
+                # a plugin name was specified so raise the error.
+                raise
 
-        # FIXME(jamielennox): Yes. This is wrong. We should be determining the
-        # plugin to use based on a combination of discovery and inputs. Much
-        # of this can be changed when we get keystoneclient 0.10. For now this
-        # hardcoded path is EXACTLY the same as the original auth_token did.
-        auth_url = '%s/v2.0' % self._identity_uri
+            # FIXME(jamielennox): Yes. This is wrong. We should be determining
+            # the plugin to use based on a combination of discovery and inputs.
+            # Much of this can be changed when we get keystoneclient 0.10. For
+            # now this hardcoded path is EXACTLY the same as the original
+            # auth_token did.
+            auth_url = '%s/v2.0' % self._identity_uri
 
-        admin_token = self._conf_get('admin_token')
-        if admin_token:
-            self._LOG.warning(
-                "The admin_token option in the auth_token middleware is "
-                "deprecated and should not be used. The admin_user and "
-                "admin_password options should be used instead. The "
-                "admin_token option may be removed in a future release.")
-            sess.auth = token_endpoint.Token(auth_url, admin_token)
-        else:
-            sess.auth = v2.Password(
-                auth_url,
-                username=self._conf_get('admin_user'),
-                password=self._conf_get('admin_password'),
-                tenant_name=self._conf_get('admin_tenant_name'))
+            admin_token = self._conf_get('admin_token')
+            if admin_token:
+                self._LOG.warning(
+                    "The admin_token option in the auth_token middleware is "
+                    "deprecated and should not be used. The admin_user and "
+                    "admin_password options should be used instead. The "
+                    "admin_token option may be removed in a future release.")
+                auth_plugin = token_endpoint.Token(auth_url, admin_token)
+            else:
+                auth_plugin = v2.Password(
+                    auth_url,
+                    username=self._conf_get('admin_user'),
+                    password=self._conf_get('admin_password'),
+                    tenant_name=self._conf_get('admin_tenant_name'))
+
+        sess = session.Session.load_from_conf_options(CONF,
+                                                      _AUTHTOKEN_GROUP,
+                                                      auth=auth_plugin)
         return sess
 
     def _identity_server_factory(self):
