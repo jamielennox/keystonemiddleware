@@ -633,7 +633,7 @@ class GeneralAuthTokenMiddlewareTest(BaseAuthTokenMiddlewareTest,
                          middleware._token_revocation_list_cache_timeout)
         self.assertEqual(False, middleware._include_service_catalog)
         self.assertEqual('https://keystone.example.com:1234',
-                         middleware._identity_uri)
+                         middleware._session.auth._identity_uri)
         self.assertEqual('0', middleware._conf['nonexsit_option'])
 
     def test_conf_values_type_convert_with_wrong_value(self):
@@ -664,8 +664,7 @@ class CommonAuthTokenMiddlewareTest(object):
         }
         self.set_middleware(conf=conf)
         expected_auth_uri = 'http://[2001:2013:1:f101::1]:1234'
-        self.assertEqual(expected_auth_uri,
-                         self.middleware._identity_server.auth_uri)
+        self.assertEqual(expected_auth_uri, self.middleware._auth_uri)
 
     def assert_valid_request_200(self, token, with_catalog=True):
         req = webob.Request.blank('/')
