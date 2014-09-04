@@ -643,8 +643,12 @@ class AuthProtocol(object):
         :returns HTTPUnauthorized http response
 
         """
-        header_val = 'Keystone uri=\'%s\'' % self._identity_server.auth_uri
-        headers = [('WWW-Authenticate', header_val)]
+        headers = []
+
+        if not env.get(auth_location.ENV_KEY):
+            header_val = 'Keystone uri=\'%s\'' % self._identity_server.auth_uri
+            headers.append(('WWW-Authenticate', header_val))
+
         resp = _MiniResp('Authentication required', env, headers)
         start_response('401 Unauthorized', resp.headers)
         return resp.body
