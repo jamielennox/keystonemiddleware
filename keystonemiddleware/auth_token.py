@@ -345,6 +345,7 @@ _OPTS = [
 _AUTHTOKEN_GROUP = 'keystone_authtoken'
 CONF = cfg.CONF
 CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
+auth.register_conf_options(CONF, 'keystone_authtoken')
 _LIST_OF_VERSIONS_TO_ATTEMPT = ['v3.0', 'v2.0']
 
 _HEADER_TEMPLATE = {
@@ -675,9 +676,28 @@ class AuthProtocol(object):
         self._include_service_catalog = self._conf_get(
             'include_service_catalog')
 
-        self._auth_uri = self._conf_get('auth_uri')
         self._session = self._session_factory()
         self._identity_server = self._identity_server_factory()
+
+        self._auth_uri = self._conf_get('auth_uri')
+
+        if self._auth_uri is None:
+            self._LOG.warning(
+                'Configuring auth_uri to point to the public identity '
+                'endpoint is required; clients may not be able to '
+                'authenticate against an admin endpoint')
+
+            # FIXME(dolph): drop support for this fallback behavior as
+            # documented in bug 1207517.
+            # NOTE(jamielennox): we urljoin '/' to get just the base URI
+            # as this is the original behaviour.
+            versioned = self._session.get_endpoint(service_type='identity',
+                                                   interface='public')
+            # FIXME(jamielennox): this versioned strip should be done via
+            # keystoneclient._discover.get_catalog_discover_hack which is not
+            # a publicly exported function.
+            unversioned = versioned.rstrip('/v2.0')
+            self._auth_uri = urllib.parse.urljoin(unversioned, '/').rstrip('/')
 
         # signing
         self._signing_dirname = self._conf_get('signing_dir')
@@ -1271,30 +1291,33 @@ class AuthProtocol(object):
             timeout=self._conf_get('http_connect_timeout')
         ))
 
-        sess.auth = _AuthTokenPlugin(
-            auth_host=self._conf_get('auth_host'),
-            auth_port=int(self._conf_get('auth_port')),
-            auth_protocol=self._conf_get('auth_protocol'),
-            auth_admin_prefix=self._conf_get('auth_admin_prefix'),
-            username=self._conf_get('admin_user'),
-            password=self._conf_get('admin_password'),
-            tenant_name=self._conf_get('admin_tenant_name'),
-            admin_token=self._conf_get('admin_token'),
-            identity_uri=self._conf_get('identity_uri'),
-            log=self._LOG)
+        # NOTE(jamielennox): Using auth plugins can only be done via the config
+        # file. These values cannot be provided by the paste config file. This
+        # is intentional to deprecate those paste provided config values, also
+        # it's really hard to support the paste dictionary format using the
+        # auth loading functions available in keystoneclient.
+        auth_plugin = auth.load_from_conf_options(CONF, _AUTHTOKEN_GROUP)
 
-        if self._auth_uri is None:
-            self._LOG.warning(
-                'Configuring auth_uri to point to the public identity '
-                'endpoint is required; clients may not be able to '
-                'authenticate against an admin endpoint')
+        if auth_plugin is None:
+            # NOTE(jamielennox): The legacy case. If an auth plugin is not
+            # specified directly then load it from the old config values.
+            auth_plugin = _AuthTokenPlugin(
+                auth_host=self._conf_get('auth_host'),
+                auth_port=int(self._conf_get('auth_port')),
+                auth_protocol=self._conf_get('auth_protocol'),
+                auth_admin_prefix=self._conf_get('auth_admin_prefix'),
+                username=self._conf_get('admin_user'),
+                password=self._conf_get('admin_password'),
+                tenant_name=self._conf_get('admin_tenant_name'),
+                admin_token=self._conf_get('admin_token'),
+                identity_uri=self._conf_get('identity_uri'),
+                log=self._LOG)
 
-            # FIXME(dolph): drop support for this fallback behavior as
-            # documented in bug 1207517.
-            # NOTE(jamielennox): we urljoin '/' to get just the base URI
-            # as this is the original behaviour.
-            auth_uri = urllib.parse.urljoin(sess.auth._identity_uri, '/')
-            self._auth_uri = auth_uri.rstrip('/')
+        # FIXME(jamielennox): Session.construct doesn't take a auth plugin as
+        # argument because it is designed as a legacy handler for older code
+        # that specifies CA arguments differently. So we have to set it
+        # manually. We should fix construct or add a better method.
+        sess.auth = auth_plugin
 
         return sess
 
