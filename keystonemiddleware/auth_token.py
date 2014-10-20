@@ -342,6 +342,7 @@ _OPTS = [
 _AUTHTOKEN_GROUP = 'keystone_authtoken'
 CONF = cfg.CONF
 CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
+auth.register_conf_options(CONF, 'keystone_authtoken')
 
 _HEADER_TEMPLATE = {
     'X%s-Domain-Id': 'domain_id',
@@ -501,14 +502,38 @@ class _MiniResp(object):
 
 class _AuthTokenPlugin(auth.BaseAuthPlugin):
 
-    def __init__(self, identity_uri, username, password, tenant_name,
-                 admin_token, log):
+    def __init__(self, auth_host, auth_port, auth_protocol, auth_admin_prefix,
+                 admin_user, admin_password, admin_tenant_name,
+                 admin_token, identity_uri, log):
+        # NOTE(jamielennox): it does appear here that our default arguments
+        # are backwards. We need to do it this way so that we can handle the
+        # same deprecation strategy for CONF and the conf variable.
+        if not identity_uri:
+            log.warning('Configuring admin URI using auth fragments. '
+                        'This is deprecated, use \'identity_uri\''
+                        ' instead.')
+
+            if netaddr.valid_ipv6(auth_host):
+                # Note(dzyu) it is an IPv6 address, so it needs to be wrapped
+                # with '[]' to generate a valid IPv6 URL, based on
+                # http://www.ietf.org/rfc/rfc2732.txt
+                auth_host = '[%s]' % auth_host
+
+            identity_uri = '%s://%s:%s' % (auth_protocol,
+                                           auth_host,
+                                           auth_port)
+
+            if auth_admin_prefix:
+                identity_uri = '%s/%s' % (identity_uri,
+                                          auth_admin_prefix.strip('/'))
+
+        self._identity_uri = identity_uri.rstrip('/')
 
         # FIXME(jamielennox): Yes. This is wrong. We should be determining the
         # plugin to use based on a combination of discovery and inputs. Much
         # of this can be changed when we get keystoneclient 0.10. For now this
         # hardcoded path is EXACTLY the same as the original auth_token did.
-        auth_url = '%s/v2.0' % identity_uri
+        auth_url = '%s/v2.0' % self._identity_uri
 
         if admin_token:
             log.warning(
@@ -519,12 +544,12 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
             self._plugin = token_endpoint.Token(auth_url, admin_token)
         else:
             self._plugin = v2.Password(auth_url,
-                                       username=username,
-                                       password=password,
-                                       tenant_name=tenant_name)
+                                       username=admin_user,
+                                       password=admin_password,
+                                       tenant_name=admin_tenant_name)
 
         self._LOG = log
-        self._identity_uri = identity_uri
+        self._discovery = None
 
     def get_token(self, *args, **kwargs):
         return self._plugin.get_token(*args, **kwargs)
@@ -535,14 +560,23 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
             # as this is the original behaviour.
             return urllib.parse.urljoin(self._identity_uri, '/').rstrip('/')
 
-        url = self._identity_uri
+        if not self._discovery:
+            self._discovery = discover.Discover(session,
+                                                auth_url=self._identity_uri,
+                                                authenticated=False)
 
-        if version and version[0] == 2:
-            url += '/v2.0'
-        elif version and version[0] == 3:
-            url += '/v3'
+        if not version:
+            return self._identity_uri
 
-        return url
+        if not self._discovery.url_for(version):
+            return None
+
+        if version == 'v2.0' or version[0] == 2:
+            return '%s/v2.0' % self._identity_uri
+        elif version == 'v3.0' or version[0] == 3:
+            return '%s/v3' % self._identity_uri
+
+        raise exceptions.EndpointNotFound()
 
     def invalidate(self):
         return self._plugin.invalidate()
@@ -596,8 +630,7 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
         return options
 
 
-CONF.register_opts(_AuthTokenPlugin.get_options(),
-                   group=_AUTHTOKEN_GROUP)
+_AuthTokenPlugin.register_conf_options(CONF, _AUTHTOKEN_GROUP)
 
 
 class _UserAuthPlugin(base_identity.BaseIdentityPlugin):
@@ -1247,60 +1280,49 @@ class AuthProtocol(object):
                 timeout=self._conf_get('http_connect_timeout')
             ))
 
-            identity_uri = self._conf_get('identity_uri')
+            # NOTE(jamielennox): Using auth plugins can only be done via the
+            # config file. These values cannot be provided by the paste config
+            # file. This is intentional to deprecate those paste provided
+            # config values, also it's really hard to support the paste
+            # dictionary format using the auth loading functions available in
+            # keystoneclient.
+            auth_plugin = auth.load_from_conf_options(CONF, _AUTHTOKEN_GROUP)
 
-            # NOTE(jamielennox): it does appear here that our default arguments
-            # are backwards. We need to do it this way so that we can handle
-            # the same deprecation strategy for CONF and the conf variable.
-            if not identity_uri:
-                self._LOG.warning('Configuring admin URI using auth fragments.'
-                                  ' This is deprecated, use \'identity_uri\''
-                                  ' instead.')
-
-                auth_host = self._conf_get('auth_host')
-                auth_port = int(self._conf_get('auth_port'))
-                auth_protocol = self._conf_get('auth_protocol')
-                auth_admin_prefix = self._conf_get('auth_admin_prefix')
-
-                if netaddr.valid_ipv6(auth_host):
-                    # Note(dzyu) it is an IPv6 address, so it needs to be
-                    # wrapped with '[]' to generate a valid IPv6 URL, based on
-                    # http://www.ietf.org/rfc/rfc2732.txt
-                    auth_host = '[%s]' % auth_host
-
-                identity_uri = '%s://%s:%s' % (auth_protocol,
-                                               auth_host,
-                                               auth_port)
-
-                if auth_admin_prefix:
-                    identity_uri = '%s/%s' % (identity_uri,
-                                              auth_admin_prefix.strip('/'))
-
-            else:
-                identity_uri = identity_uri.rstrip('/')
-
-            auth_plugin = _AuthTokenPlugin(
-                username=self._conf_get('admin_user'),
-                password=self._conf_get('admin_password'),
-                tenant_name=self._conf_get('admin_tenant_name'),
-                admin_token=self._conf_get('admin_token'),
-                identity_uri=identity_uri,
-                log=self._LOG)
+            if auth_plugin is None:
+                # NOTE(jamielennox): Loading AuthTokenPlugin here should be
+                # exactly the same as calling
+                # _AuthTokenPlugin.load_from_conf_options(CONF, GROUP)
+                # however because we can't do that because we have to use
+                # _conf_get to support the paste.ini options.
+                auth_plugin = _AuthTokenPlugin.load_from_options(
+                    auth_host=self._conf_get('auth_host'),
+                    auth_port=self._conf_get('auth_port'),
+                    auth_protocol=self._conf_get('auth_protocol'),
+                    auth_admin_prefix=self._conf_get('auth_admin_prefix'),
+                    admin_user=self._conf_get('admin_user'),
+                    admin_password=self._conf_get('admin_password'),
+                    admin_tenant_name=self._conf_get('admin_tenant_name'),
+                    admin_token=self._conf_get('admin_token'),
+                    identity_uri=self._conf_get('identity_uri'),
+                    log=self._LOG)
 
             auth_version = self._conf_get('auth_version')
             server_class = None
+
+            adap = adapter.Adapter(
+                sess,
+                auth=auth_plugin,
+                service_type='identity',
+                interface='admin',
+                connect_retries=self._conf_get('http_request_max_retries'))
 
             if auth_version == 'v3.0':
                 server_class = _V3IdentityServer
             elif auth_version:
                 server_class = _V2IdentityServer
             else:
-                disc = discover.Discover(sess,
-                                         auth_url=identity_uri + '/',
-                                         authenticated=False)
-
                 for version, klass in six.iteritems(VERSIONS_TO_ATTEMPT):
-                    if disc.url_for(version):
+                    if adap.get_endpoint(version=version):
                         self._LOG.info('Auth Token confirmed use of %s apis',
                                        version)
                         server_class = klass
@@ -1309,13 +1331,6 @@ class AuthProtocol(object):
                     msg = 'Attempted versions [%s] not supported by server'
                     self._LOG.error(msg, ', '.join(VERSIONS_TO_ATTEMPT.keys()))
                     raise ServiceError('No compatible api supported by server')
-
-            adap = adapter.Adapter(
-                sess,
-                auth=auth_plugin,
-                service_type='identity',
-                interface='admin',
-                connect_retries=self._conf_get('http_request_max_retries'))
 
             auth_uri = self._conf_get('auth_uri')
             if auth_uri is None:
