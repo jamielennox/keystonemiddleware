@@ -1544,9 +1544,9 @@ class _IdentityServer(object):
     def _get_supported_versions(self):
         versions = []
         for v in ['v3.0', 'v2.0']:
-            if self.session.get_endpoint(interface='public',
-                                         service_type='identity',
-                                         version=v):
+            if self._session.get_endpoint(interface='public',
+                                          service_type='identity',
+                                          version=v):
                 versions.append(v)
         return versions
 #
