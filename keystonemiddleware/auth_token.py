@@ -1543,28 +1543,37 @@ class _IdentityServer(object):
 
     def _get_supported_versions(self):
         versions = []
-        response, data = self._json_request('GET', '/', authenticated=False)
-        if response.status_code == 501:
-            self._LOG.warning(
-                'Old keystone installation found...assuming v2.0')
-            versions.append('v2.0')
-        elif response.status_code != 300:
-            self._LOG.error('Unable to get version info from keystone: %s',
-                            response.status_code)
-            raise ServiceError('Unable to get version info from keystone')
-        else:
-            try:
-                for version in data['versions']['values']:
-                    versions.append(version['id'])
-            except KeyError:
-                self._LOG.error(
-                    'Invalid version response format from server')
-                raise ServiceError('Unable to parse version response '
-                                   'from keystone')
-
-        self._LOG.debug('Server reports support for api versions: %s',
-                        ', '.join(versions))
+        for v in ['v3.0', 'v2.0']:
+            if self.session.get_endpoint(interface='public',
+                                         service_type='identity',
+                                         version=v):
+                versions.append(v)
         return versions
+#
+#
+#         versions = []
+#         response, data = self._json_request('GET', '/', authenticated=False)
+#         if response.status_code == 501:
+#             self._LOG.warning(
+#                 'Old keystone installation found...assuming v2.0')
+#             versions.append('v2.0')
+#         elif response.status_code != 300:
+#             self._LOG.error('Unable to get version info from keystone: %s',
+#                             response.status_code)
+#             raise ServiceError('Unable to get version info from keystone')
+#         else:
+#             try:
+#                 for version in data['versions']['values']:
+#                     versions.append(version['id'])
+#             except KeyError:
+#                 self._LOG.error(
+#                     'Invalid version response format from server')
+#                 raise ServiceError('Unable to parse version response '
+#                                    'from keystone')
+#
+#         self._LOG.debug('Server reports support for api versions: %s',
+#                         ', '.join(versions))
+#         return versions
 
     def _http_request(self, method, path, **kwargs):
         """HTTP request helper used to make unspecified content type requests.
