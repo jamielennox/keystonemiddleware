@@ -342,7 +342,6 @@ _OPTS = [
 _AUTHTOKEN_GROUP = 'keystone_authtoken'
 CONF = cfg.CONF
 CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
-_LIST_OF_VERSIONS_TO_ATTEMPT = ['v3.0', 'v2.0']
 
 _HEADER_TEMPLATE = {
     'X%s-Domain-Id': 'domain_id',
@@ -530,8 +529,11 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
     def get_token(self, *args, **kwargs):
         return self._plugin.get_token(*args, **kwargs)
 
-    def get_endpoint(self, session, version=None, **kwargs):
-        # we don't care, we've always used the identity_info
+    def get_endpoint(self, session, interface=None, version=None, **kwargs):
+        if interface == auth.AUTH_INTERFACE:
+            # NOTE(jamielennox): we urljoin '/' to get just the base URI
+            # as this is the original behaviour.
+            return urllib.parse.urljoin(self._identity_uri, '/').rstrip('/')
 
         url = self._identity_uri
 
@@ -651,9 +653,7 @@ class AuthProtocol(object):
         self._include_service_catalog = self._conf_get(
             'include_service_catalog')
 
-        self._auth_uri = self._conf_get('auth_uri')
-        self._session = self._session_factory()
-        self._identity_server = self._identity_server_factory()
+        self._identity_server_obj = None
 
         # signing
         self._signing_dirname = self._conf_get('signing_dir')
@@ -827,7 +827,7 @@ class AuthProtocol(object):
 
     @property
     def _reject_auth_headers(self):
-        header_val = 'Keystone uri=\'%s\'' % self._auth_uri
+        header_val = 'Keystone uri=\'%s\'' % self._identity_server._auth_uri
         return [('WWW-Authenticate', header_val)]
 
     def _reject_request(self, env, start_response):
@@ -1236,85 +1236,104 @@ class AuthProtocol(object):
             self._signing_ca_file_name,
             self._identity_server.fetch_ca_cert())
 
-    # NOTE(hrybacki): This and subsequent factory functions are part of a
-    # cleanup and better organization effort of AuthProtocol.
-    def _session_factory(self):
-        sess = session.Session.construct(dict(
-            cert=self._conf_get('certfile'),
-            key=self._conf_get('keyfile'),
-            cacert=self._conf_get('cafile'),
-            insecure=self._conf_get('insecure'),
-            timeout=self._conf_get('http_connect_timeout')
-        ))
+    @property
+    def _identity_server(self):
+        if not self._identity_server_obj:
+            sess = session.Session.construct(dict(
+                cert=self._conf_get('certfile'),
+                key=self._conf_get('keyfile'),
+                cacert=self._conf_get('cafile'),
+                insecure=self._conf_get('insecure'),
+                timeout=self._conf_get('http_connect_timeout')
+            ))
 
-        identity_uri = self._conf_get('identity_uri')
+            identity_uri = self._conf_get('identity_uri')
 
-        # NOTE(jamielennox): it does appear here that our default arguments
-        # are backwards. We need to do it this way so that we can handle the
-        # same deprecation strategy for CONF and the conf variable.
-        if not identity_uri:
-            self._LOG.warning('Configuring admin URI using auth fragments. '
-                              'This is deprecated, use \'identity_uri\''
-                              ' instead.')
+            # NOTE(jamielennox): it does appear here that our default arguments
+            # are backwards. We need to do it this way so that we can handle
+            # the same deprecation strategy for CONF and the conf variable.
+            if not identity_uri:
+                self._LOG.warning('Configuring admin URI using auth fragments.'
+                                  ' This is deprecated, use \'identity_uri\''
+                                  ' instead.')
 
-            auth_host = self._conf_get('auth_host')
-            auth_port = int(self._conf_get('auth_port'))
-            auth_protocol = self._conf_get('auth_protocol')
-            auth_admin_prefix = self._conf_get('auth_admin_prefix')
+                auth_host = self._conf_get('auth_host')
+                auth_port = int(self._conf_get('auth_port'))
+                auth_protocol = self._conf_get('auth_protocol')
+                auth_admin_prefix = self._conf_get('auth_admin_prefix')
 
-            if netaddr.valid_ipv6(auth_host):
-                # Note(dzyu) it is an IPv6 address, so it needs to be wrapped
-                # with '[]' to generate a valid IPv6 URL, based on
-                # http://www.ietf.org/rfc/rfc2732.txt
-                auth_host = '[%s]' % auth_host
+                if netaddr.valid_ipv6(auth_host):
+                    # Note(dzyu) it is an IPv6 address, so it needs to be
+                    # wrapped with '[]' to generate a valid IPv6 URL, based on
+                    # http://www.ietf.org/rfc/rfc2732.txt
+                    auth_host = '[%s]' % auth_host
 
-            identity_uri = '%s://%s:%s' % (auth_protocol,
-                                           auth_host,
-                                           auth_port)
+                identity_uri = '%s://%s:%s' % (auth_protocol,
+                                               auth_host,
+                                               auth_port)
 
-            if auth_admin_prefix:
-                identity_uri = '%s/%s' % (identity_uri,
-                                          auth_admin_prefix.strip('/'))
+                if auth_admin_prefix:
+                    identity_uri = '%s/%s' % (identity_uri,
+                                              auth_admin_prefix.strip('/'))
 
-        else:
-            identity_uri = identity_uri.rstrip('/')
+            else:
+                identity_uri = identity_uri.rstrip('/')
 
-        self._identity_uri = identity_uri
+            auth_plugin = _AuthTokenPlugin(
+                username=self._conf_get('admin_user'),
+                password=self._conf_get('admin_password'),
+                tenant_name=self._conf_get('admin_tenant_name'),
+                admin_token=self._conf_get('admin_token'),
+                identity_uri=identity_uri,
+                log=self._LOG)
 
-        sess.auth = _AuthTokenPlugin(
-            username=self._conf_get('admin_user'),
-            password=self._conf_get('admin_password'),
-            tenant_name=self._conf_get('admin_tenant_name'),
-            admin_token=self._conf_get('admin_token'),
-            identity_uri=identity_uri,
-            log=self._LOG)
+            auth_version = self._conf_get('auth_version')
+            server_class = None
 
-        if self._auth_uri is None:
-            self._LOG.warning(
-                'Configuring auth_uri to point to the public identity '
-                'endpoint is required; clients may not be able to '
-                'authenticate against an admin endpoint')
+            if auth_version == 'v3.0':
+                server_class = _V3IdentityServer
+            elif auth_version:
+                server_class = _V2IdentityServer
+            else:
+                disc = discover.Discover(sess,
+                                         auth_url=identity_uri + '/',
+                                         authenticated=False)
 
-            # FIXME(dolph): drop support for this fallback behavior as
-            # documented in bug 1207517.
-            # NOTE(jamielennox): we urljoin '/' to get just the base URI
-            # as this is the original behaviour.
-            auth_uri = urllib.parse.urljoin(identity_uri, '/')
-            self._auth_uri = auth_uri.rstrip('/')
+                for version, klass in six.iteritems(VERSIONS_TO_ATTEMPT):
+                    if disc.url_for(version):
+                        self._LOG.info('Auth Token confirmed use of %s apis',
+                                       version)
+                        server_class = klass
+                        break
+                else:
+                    msg = 'Attempted versions [%s] not supported by server'
+                    self._LOG.error(msg, ', '.join(VERSIONS_TO_ATTEMPT.keys()))
+                    raise ServiceError('No compatible api supported by server')
 
-        return sess
+            adap = adapter.Adapter(
+                sess,
+                auth=auth_plugin,
+                service_type='identity',
+                interface='admin',
+                connect_retries=self._conf_get('http_request_max_retries'))
 
-    def _identity_server_factory(self):
-        http_request_max_retries = self._conf_get('http_request_max_retries')
+            auth_uri = self._conf_get('auth_uri')
+            if auth_uri is None:
+                self._LOG.warning(
+                    'Configuring auth_uri to point to the public identity '
+                    'endpoint is required; clients may not be able to '
+                    'authenticate against an admin endpoint')
 
-        identity_server = _IdentityServer(
-            self._LOG,
-            self._session,
-            include_service_catalog=self._include_service_catalog,
-            http_request_max_retries=http_request_max_retries,
-            identity_uri=self._identity_uri,
-            auth_version=self._conf_get('auth_version'))
-        return identity_server
+                # FIXME(dolph): drop support for this fallback behavior as
+                # documented in bug 1207517.
+                auth_uri = adap.get_endpoint(interface=auth.AUTH_INTERFACE)
+
+            self._identity_server_obj = server_class(
+                self._LOG, adap,
+                auth_uri=auth_uri,
+                include_service_catalog=self._include_service_catalog)
+
+        return self._identity_server_obj
 
     def _token_cache_factory(self):
         security_strategy = self._conf_get('memcache_security_strategy')
@@ -1453,23 +1472,13 @@ class _IdentityServer(object):
     operations.
 
     """
-    def __init__(self, log, session, include_service_catalog=None,
-                 http_request_max_retries=None, identity_uri=None,
-                 auth_version=None):
+    def __init__(self, log, adapter,
+                 auth_uri=None, include_service_catalog=None):
         self._LOG = log
+        self._adapter = adapter
+        self._json = _JsonView(adapter)
+        self._auth_uri = auth_uri
         self._include_service_catalog = include_service_catalog
-        self._req_auth_version = auth_version
-        self._session = session
-        self._auth_version = None
-        self._identity_uri = identity_uri
-
-        self._adapter = adapter.Adapter(
-            session,
-            service_type='identity',
-            interface='public',
-            connect_retries=http_request_max_retries)
-
-        self._json = _JsonView(self._adapter)
 
     def verify_token(self, user_token, retry=True):
         """Authenticate user token with keystone.
@@ -1485,30 +1494,8 @@ class _IdentityServer(object):
         """
         user_token = _safe_quote(user_token)
 
-        # Determine the highest api version we can use.
-        if not self._auth_version:
-            self._auth_version = self._choose_api_version()
-
-        headers = {}
-
-        if self._auth_version == 'v3.0':
-            headers['X-Subject-Token'] = user_token
-            version = (3, 0)
-            path = '/auth/tokens'
-            if not self._include_service_catalog:
-                # NOTE(gyee): only v3 API support this option
-                path = path + '?nocatalog'
-
-        else:
-            version = (2, 0)
-            path = '/tokens/%s' % user_token
-
         try:
-            response, data = self._json.get(
-                path,
-                authenticated=True,
-                endpoint_filter={'version': version},
-                headers=headers)
+            response, data = self._do_verify_token(user_token)
         except exceptions.NotFound as e:
             self._LOG.warn('Authorization failed for token')
             self._LOG.warn('Identity response: %s' % e.response.text)
@@ -1549,59 +1536,53 @@ class _IdentityServer(object):
     def fetch_ca_cert(self):
         return self._fetch_cert_file('ca')
 
-    def _choose_api_version(self):
-        """Determine the api version that we should use."""
-
-        # If the configuration specifies an auth_version we will just
-        # assume that is correct and use it.  We could, of course, check
-        # that this version is supported by the server, but in case
-        # there are some problems in the field, we want as little code
-        # as possible in the way of letting auth_token talk to the
-        # server.
-        if self._req_auth_version:
-            self._LOG.info('Auth Token proceeding with requested %s apis',
-                           self._req_auth_version)
-            return self._req_auth_version
-
-        disc = discover.Discover(self._session,
-                                 auth_url=self._identity_uri + '/',
-                                 authenticated=False)
-
-        for version in _LIST_OF_VERSIONS_TO_ATTEMPT:
-            if disc.url_for(version):
-                self._LOG.info('Auth Token confirmed use of %s apis',
-                               version)
-                return version
-
-        self._LOG.error('Attempted versions [%s] not supported by server',
-                        ', '.join(_LIST_OF_VERSIONS_TO_ATTEMPT))
-        raise ServiceError('No compatible apis supported by server')
-
     def _fetch_cert_file(self, cert_type):
-        if not self._auth_version:
-            self._auth_version = self._choose_api_version()
-
-        version = None
-
-        if self._auth_version == 'v3.0':
-            if cert_type == 'signing':
-                cert_type = 'certificates'
-            path = '/OS-SIMPLE-CERT/' + cert_type
-            version = (3, 0)
-        else:
-            path = '/certificates/' + cert_type
-            version = (2, 0)
-
         try:
-            response = self._adapter.get(
-                path,
-                authenticated=False,
-                endpoint_filter={'version': version})
+            response = self._do_fetch_cert_file(cert_type)
         except exceptions.HTTPError as e:
             raise exceptions.CertificateConfigError(e.details)
         if response.status_code != 200:
             raise exceptions.CertificateConfigError(response.text)
         return response.text
+
+
+class _V2IdentityServer(_IdentityServer):
+
+    version = (2, 0)
+
+    def _do_verify_token(self, user_token):
+        return self._json.get('/tokens/%s' % user_token,
+                              authenticated=True,
+                              endpoint_filter={'version': self.version})
+
+    def _do_fetch_cert_file(self, cert_type):
+        return self._adapter.get('/certificates/%s' % cert_type,
+                                 authenticated=False,
+                                 endpoint_filter={'version': self.version})
+
+
+class _V3IdentityServer(_IdentityServer):
+
+    version = (3, 0)
+
+    def _do_verify_token(self, user_token):
+        path = '/auth/tokens'
+        if not self._include_service_catalog:
+            # NOTE(gyee): only v3 API support this option
+            path += '?nocatalog'
+
+        return self._json.get(path,
+                              authenticated=True,
+                              endpoint_filter={'version': self.version},
+                              headers={'X-Subject-Token': user_token})
+
+    def _do_fetch_cert_file(self, cert_type):
+        if cert_type == 'signing':
+            cert_type = 'certificates'
+
+        return self._adapter.get('/OS-SIMPLE-CERT/%s' % cert_type,
+                                 authenticated=False,
+                                 endpoint_filter={'version': self.version})
 
 
 class _TokenCache(object):
@@ -1907,6 +1888,10 @@ def app_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
     return AuthProtocol(None, conf)
+
+
+VERSIONS_TO_ATTEMPT = {'v3.0': _V3IdentityServer,
+                       'v2.0': _V2IdentityServer}
 
 
 if __name__ == '__main__':
