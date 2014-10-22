@@ -632,8 +632,14 @@ class CommonAuthTokenMiddlewareTest(object):
             'auth_protocol': 'http',
             'auth_uri': None,
         }
-        self.set_middleware(conf=conf)
+
         expected_auth_uri = 'http://[2001:2013:1:f101::1]:1234'
+        self.requests.register_uri('GET',
+                                   "%s/" % expected_auth_uri,
+                                   json=VERSION_LIST_v3,
+                                   status_code=300)
+
+        self.set_middleware(conf=conf)
         self.assertEqual(expected_auth_uri,
                          self.middleware._identity_server.auth_uri)
 
@@ -2105,6 +2111,14 @@ class CatalogConversionTests(BaseAuthTokenMiddlewareTest):
 
 
 class DelayedAuthTests(BaseAuthTokenMiddlewareTest):
+
+    def setUp(self):
+        super(DelayedAuthTests, self).setUp()
+
+        self.requests.register_uri('GET',
+                                   BASE_URI,
+                                   json=VERSION_LIST_v3,
+                                   status_code=300)
 
     def test_header_in_401(self):
         body = uuid.uuid4().hex
