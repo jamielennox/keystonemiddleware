@@ -174,6 +174,7 @@ from keystoneclient.auth.identity import base as base_identity
 from keystoneclient.auth.identity import v2
 from keystoneclient.auth import token_endpoint
 from keystoneclient.common import cms
+from keystoneclient import discover
 from keystoneclient import exceptions
 from keystoneclient import session
 import netaddr
@@ -501,33 +502,8 @@ class _MiniResp(object):
 
 class _AuthTokenPlugin(auth.BaseAuthPlugin):
 
-    def __init__(self, auth_host, auth_port, auth_protocol, auth_admin_prefix,
-                 username, password, tenant_name,
-                 admin_token, identity_uri, log):
-        # NOTE(jamielennox): it does appear here that our default arguments
-        # are backwards. We need to do it this way so that we can handle the
-        # same deprecation strategy for CONF and the conf variable.
-        if not identity_uri:
-            log.warning('Configuring admin URI using auth fragments. '
-                        'This is deprecated, use \'identity_uri\''
-                        ' instead.')
-
-            if netaddr.valid_ipv6(auth_host):
-                # Note(dzyu) it is an IPv6 address, so it needs to be wrapped
-                # with '[]' to generate a valid IPv6 URL, based on
-                # http://www.ietf.org/rfc/rfc2732.txt
-                auth_host = '[%s]' % auth_host
-
-            identity_uri = '%s://%s:%s' % (auth_protocol,
-                                           auth_host,
-                                           auth_port)
-
-            if auth_admin_prefix:
-                identity_uri = '%s/%s' % (identity_uri,
-                                          auth_admin_prefix.strip('/'))
-
-        else:
-            identity_uri = identity_uri.rstrip('/')
+    def __init__(self, identity_uri, username, password, tenant_name,
+                 admin_token, log):
 
         # FIXME(jamielennox): Yes. This is wrong. We should be determining the
         # plugin to use based on a combination of discovery and inputs. Much
@@ -549,7 +525,7 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
                                        tenant_name=tenant_name)
 
         self._LOG = log
-        self._identity_uri = identity_uri.rstrip('/')
+        self._identity_uri = identity_uri
 
     def get_token(self, *args, **kwargs):
         return self._plugin.get_token(*args, **kwargs)
@@ -1271,16 +1247,46 @@ class AuthProtocol(object):
             timeout=self._conf_get('http_connect_timeout')
         ))
 
+        identity_uri = self._conf_get('identity_uri')
+
+        # NOTE(jamielennox): it does appear here that our default arguments
+        # are backwards. We need to do it this way so that we can handle the
+        # same deprecation strategy for CONF and the conf variable.
+        if not identity_uri:
+            self._LOG.warning('Configuring admin URI using auth fragments. '
+                              'This is deprecated, use \'identity_uri\''
+                              ' instead.')
+
+            auth_host = self._conf_get('auth_host')
+            auth_port = int(self._conf_get('auth_port'))
+            auth_protocol = self._conf_get('auth_protocol')
+            auth_admin_prefix = self._conf_get('auth_admin_prefix')
+
+            if netaddr.valid_ipv6(auth_host):
+                # Note(dzyu) it is an IPv6 address, so it needs to be wrapped
+                # with '[]' to generate a valid IPv6 URL, based on
+                # http://www.ietf.org/rfc/rfc2732.txt
+                auth_host = '[%s]' % auth_host
+
+            identity_uri = '%s://%s:%s' % (auth_protocol,
+                                           auth_host,
+                                           auth_port)
+
+            if auth_admin_prefix:
+                identity_uri = '%s/%s' % (identity_uri,
+                                          auth_admin_prefix.strip('/'))
+
+        else:
+            identity_uri = identity_uri.rstrip('/')
+
+        self._identity_uri = identity_uri
+
         sess.auth = _AuthTokenPlugin(
-            auth_host=self._conf_get('auth_host'),
-            auth_port=int(self._conf_get('auth_port')),
-            auth_protocol=self._conf_get('auth_protocol'),
-            auth_admin_prefix=self._conf_get('auth_admin_prefix'),
             username=self._conf_get('admin_user'),
             password=self._conf_get('admin_password'),
             tenant_name=self._conf_get('admin_tenant_name'),
             admin_token=self._conf_get('admin_token'),
-            identity_uri=self._conf_get('identity_uri'),
+            identity_uri=identity_uri,
             log=self._LOG)
 
         if self._auth_uri is None:
@@ -1293,7 +1299,7 @@ class AuthProtocol(object):
             # documented in bug 1207517.
             # NOTE(jamielennox): we urljoin '/' to get just the base URI
             # as this is the original behaviour.
-            auth_uri = urllib.parse.urljoin(sess.auth._identity_uri, '/')
+            auth_uri = urllib.parse.urljoin(identity_uri, '/')
             self._auth_uri = auth_uri.rstrip('/')
 
         return sess
@@ -1306,6 +1312,7 @@ class AuthProtocol(object):
             self._session,
             include_service_catalog=self._include_service_catalog,
             http_request_max_retries=http_request_max_retries,
+            identity_uri=self._identity_uri,
             auth_version=self._conf_get('auth_version'))
         return identity_server
 
@@ -1447,13 +1454,14 @@ class _IdentityServer(object):
 
     """
     def __init__(self, log, session, include_service_catalog=None,
-                 http_request_max_retries=None,
+                 http_request_max_retries=None, identity_uri=None,
                  auth_version=None):
         self._LOG = log
         self._include_service_catalog = include_service_catalog
         self._req_auth_version = auth_version
         self._session = session
         self._auth_version = None
+        self._identity_uri = identity_uri
 
         self._adapter = adapter.Adapter(
             session,
@@ -1551,53 +1559,23 @@ class _IdentityServer(object):
         # as possible in the way of letting auth_token talk to the
         # server.
         if self._req_auth_version:
-            version_to_use = self._req_auth_version
             self._LOG.info('Auth Token proceeding with requested %s apis',
-                           version_to_use)
-        else:
-            version_to_use = None
-            versions_supported_by_server = self._get_supported_versions()
-            if versions_supported_by_server:
-                for version in _LIST_OF_VERSIONS_TO_ATTEMPT:
-                    if version in versions_supported_by_server:
-                        version_to_use = version
-                        break
-            if version_to_use:
+                           self._req_auth_version)
+            return self._req_auth_version
+
+        disc = discover.Discover(self._session,
+                                 auth_url=self._identity_uri + '/',
+                                 authenticated=False)
+
+        for version in _LIST_OF_VERSIONS_TO_ATTEMPT:
+            if disc.url_for(version):
                 self._LOG.info('Auth Token confirmed use of %s apis',
-                               version_to_use)
-            else:
-                self._LOG.error(
-                    'Attempted versions [%s] not in list supported by '
-                    'server [%s]',
-                    ', '.join(_LIST_OF_VERSIONS_TO_ATTEMPT),
-                    ', '.join(versions_supported_by_server))
-                raise ServiceError('No compatible apis supported by server')
-        return version_to_use
+                               version)
+                return version
 
-    def _get_supported_versions(self):
-        versions = []
-        response, data = self._json.get('/', authenticated=False)
-        if response.status_code == 501:
-            self._LOG.warning(
-                'Old keystone installation found...assuming v2.0')
-            versions.append('v2.0')
-        elif response.status_code != 300:
-            self._LOG.error('Unable to get version info from keystone: %s',
-                            response.status_code)
-            raise ServiceError('Unable to get version info from keystone')
-        else:
-            try:
-                for version in data['versions']['values']:
-                    versions.append(version['id'])
-            except KeyError:
-                self._LOG.error(
-                    'Invalid version response format from server')
-                raise ServiceError('Unable to parse version response '
-                                   'from keystone')
-
-        self._LOG.debug('Server reports support for api versions: %s',
-                        ', '.join(versions))
-        return versions
+        self._LOG.error('Attempted versions [%s] not supported by server',
+                        ', '.join(_LIST_OF_VERSIONS_TO_ATTEMPT))
+        raise ServiceError('No compatible apis supported by server')
 
     def _fetch_cert_file(self, cert_type):
         if not self._auth_version:
