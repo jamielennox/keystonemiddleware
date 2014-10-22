@@ -174,6 +174,7 @@ from keystoneclient.auth.identity import base as base_identity
 from keystoneclient.auth.identity import v2
 from keystoneclient.auth import token_endpoint
 from keystoneclient.common import cms
+from keystoneclient import discover
 from keystoneclient import exceptions
 from keystoneclient import session
 import netaddr
@@ -1509,56 +1510,24 @@ class _IdentityServer(object):
         # as possible in the way of letting auth_token talk to the
         # server.
         if self._req_auth_version:
-            version_to_use = self._req_auth_version
             self._LOG.info('Auth Token proceeding with requested %s apis',
-                           version_to_use)
-        else:
-            version_to_use = None
-            versions_supported_by_server = self._get_supported_versions()
-            if versions_supported_by_server:
-                for version in _LIST_OF_VERSIONS_TO_ATTEMPT:
-                    if version in versions_supported_by_server:
-                        version_to_use = version
-                        break
-            if version_to_use:
+                           self._req_auth_version)
+            return self._req_auth_version
+
+        auth_url = self._adapter.get_endpoint(interface=auth.AUTH_INTERFACE)
+        disc = discover.Discover(self._adapter,
+                                 auth_url=auth_url + '/',
+                                 authenticated=False)
+
+        for version in _LIST_OF_VERSIONS_TO_ATTEMPT:
+            if disc.url_for(version):
                 self._LOG.info('Auth Token confirmed use of %s apis',
-                               version_to_use)
-            else:
-                self._LOG.error(
-                    'Attempted versions [%s] not in list supported by '
-                    'server [%s]',
-                    ', '.join(_LIST_OF_VERSIONS_TO_ATTEMPT),
-                    ', '.join(versions_supported_by_server))
-                raise ServiceError('No compatible apis supported by server')
-        return version_to_use
+                               version)
+                return version
 
-    def _get_supported_versions(self):
-        versions = []
-        response, data = self._json_request(
-            'GET', '/',
-            authenticated=False,
-            endpoint_filter={'interface': auth.AUTH_INTERFACE})
-        if response.status_code == 501:
-            self._LOG.warning(
-                'Old keystone installation found...assuming v2.0')
-            versions.append('v2.0')
-        elif response.status_code != 300:
-            self._LOG.error('Unable to get version info from keystone: %s',
-                            response.status_code)
-            raise ServiceError('Unable to get version info from keystone')
-        else:
-            try:
-                for version in data['versions']['values']:
-                    versions.append(version['id'])
-            except KeyError:
-                self._LOG.error(
-                    'Invalid version response format from server')
-                raise ServiceError('Unable to parse version response '
-                                   'from keystone')
-
-        self._LOG.debug('Server reports support for api versions: %s',
-                        ', '.join(versions))
-        return versions
+        self._LOG.error('Attempted versions [%s] not supported by server',
+                        ', '.join(_LIST_OF_VERSIONS_TO_ATTEMPT))
+        raise ServiceError('No compatible apis supported by server')
 
     def _json_request(self, method, path, **kwargs):
         """HTTP request helper used to make json requests.
