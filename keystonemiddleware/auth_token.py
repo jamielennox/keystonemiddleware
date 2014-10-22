@@ -168,6 +168,7 @@ import stat
 import tempfile
 
 from keystoneclient import access
+from keystoneclient import adapter
 from keystoneclient import auth
 from keystoneclient.auth.identity import base as base_identity
 from keystoneclient.auth.identity import v2
@@ -1392,6 +1393,50 @@ class _MemcacheClientPool(object):
             yield client
 
 
+class _JsonView(object):
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def request(self, *args, **kwargs):
+        headers = kwargs.setdefault('headers', {})
+        headers.setdefault('Accept', 'application/json')
+
+        try:
+            kwargs['json'] = kwargs.pop('body')
+        except KeyError:
+            pass
+
+        resp = self.adapter.request(*args, **kwargs)
+
+        body = None
+        if resp.text:
+            try:
+                body = jsonutils.loads(resp.text)
+            except ValueError:
+                pass
+
+        return resp, body
+
+    def get(self, url, **kwargs):
+        return self.request(url, 'GET', **kwargs)
+
+    def head(self, url, **kwargs):
+        return self.request(url, 'HEAD', **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request(url, 'POST', **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request(url, 'PUT', **kwargs)
+
+    def patch(self, url, **kwargs):
+        return self.request(url, 'PATCH', **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request(url, 'DELETE', **kwargs)
+
+
 class _IdentityServer(object):
     """Operations on the Identity API server.
 
@@ -1409,7 +1454,14 @@ class _IdentityServer(object):
         self._req_auth_version = auth_version
         self._session = session
         self._auth_version = None
-        self._http_request_max_retries = http_request_max_retries
+
+        self._adapter = adapter.Adapter(
+            session,
+            service_type='identity',
+            interface='public',
+            connect_retries=http_request_max_retries)
+
+        self._json = _JsonView(self._adapter)
 
     def verify_token(self, user_token, retry=True):
         """Authenticate user token with keystone.
@@ -1444,8 +1496,7 @@ class _IdentityServer(object):
             path = '/tokens/%s' % user_token
 
         try:
-            response, data = self._json_request(
-                'GET',
+            response, data = self._json.get(
                 path,
                 authenticated=True,
                 endpoint_filter={'version': version},
@@ -1471,8 +1522,8 @@ class _IdentityServer(object):
 
     def fetch_revocation_list(self):
         try:
-            response, data = self._json_request(
-                'GET', 'tokens/revoked',
+            response, data = self._json.get(
+                'tokens/revoked',
                 authenticated=True,
                 endpoint_filter={'version': (2, 0)})
         except exceptions.HTTPError as e:
@@ -1525,7 +1576,7 @@ class _IdentityServer(object):
 
     def _get_supported_versions(self):
         versions = []
-        response, data = self._json_request('GET', '/', authenticated=False)
+        response, data = self._json.get('/', authenticated=False)
         if response.status_code == 501:
             self._LOG.warning(
                 'Old keystone installation found...assuming v2.0')
@@ -1548,46 +1599,6 @@ class _IdentityServer(object):
                         ', '.join(versions))
         return versions
 
-    def _http_request(self, method, path, **kwargs):
-        """HTTP request helper used to make unspecified content type requests.
-
-        :param method: http method
-        :param path: relative request url
-        :return (http response object, response body)
-        :raise ServerError when unable to communicate with keystone
-
-        """
-        kwargs.setdefault('connect_retries', self._http_request_max_retries)
-
-        endpoint_filter = kwargs.setdefault('endpoint_filter', {})
-        endpoint_filter.setdefault('service_type', 'identity')
-        endpoint_filter.setdefault('interface', 'public')
-
-        return self._session.request(path, method, **kwargs)
-
-    def _json_request(self, method, path, **kwargs):
-        """HTTP request helper used to make json requests.
-
-        :param method: http method
-        :param path: relative request url
-        :param **kwargs: additional parameters used by session or endpoint
-        :return (http response object, response body parsed as json)
-        :raise ServerError when unable to communicate with keystone
-
-        """
-        headers = kwargs.setdefault('headers', {})
-        headers['Accept'] = 'application/json'
-
-        response = self._http_request(method, path, **kwargs)
-
-        try:
-            data = jsonutils.loads(response.text)
-        except ValueError:
-            self._LOG.debug('Keystone did not return json-encoded body')
-            data = {}
-
-        return response, data
-
     def _fetch_cert_file(self, cert_type):
         if not self._auth_version:
             self._auth_version = self._choose_api_version()
@@ -1604,8 +1615,8 @@ class _IdentityServer(object):
             version = (2, 0)
 
         try:
-            response = self._http_request(
-                'GET', path,
+            response = self._adapter.get(
+                path,
                 authenticated=False,
                 endpoint_filter={'version': version})
         except exceptions.HTTPError as e:
