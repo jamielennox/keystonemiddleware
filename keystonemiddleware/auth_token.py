@@ -342,6 +342,7 @@ _OPTS = [
 _AUTHTOKEN_GROUP = 'keystone_authtoken'
 CONF = cfg.CONF
 CONF.register_opts(_OPTS, group=_AUTHTOKEN_GROUP)
+auth.register_conf_options(CONF, 'keystone_authtoken')
 
 _HEADER_TEMPLATE = {
     'X%s-Domain-Id': 'domain_id',
@@ -1279,21 +1280,31 @@ class AuthProtocol(object):
                 timeout=self._conf_get('http_connect_timeout')
             ))
 
-            # NOTE(jamielennox): Loading AuthTokenPlugin here should be exactly
-            # the same as calling _AuthTokenPlugin.load_from_conf_options(CONF,
-            # GROUP) however we can't do that because we have to use _conf_get
-            # to support the paste.ini options.
-            auth_plugin = _AuthTokenPlugin.load_from_options(
-                auth_host=self._conf_get('auth_host'),
-                auth_port=int(self._conf_get('auth_port')),
-                auth_protocol=self._conf_get('auth_protocol'),
-                auth_admin_prefix=self._conf_get('auth_admin_prefix'),
-                admin_user=self._conf_get('admin_user'),
-                admin_password=self._conf_get('admin_password'),
-                admin_tenant_name=self._conf_get('admin_tenant_name'),
-                admin_token=self._conf_get('admin_token'),
-                identity_uri=self._conf_get('identity_uri'),
-                log=self._LOG)
+            # NOTE(jamielennox): Using auth plugins can only be done via the
+            # config file. These values cannot be provided by the paste config
+            # file. This is intentional to deprecate those paste provided
+            # config values, also it's really hard to support the paste
+            # dictionary format using the auth loading functions available in
+            # keystoneclient.
+            auth_plugin = auth.load_from_conf_options(CONF, _AUTHTOKEN_GROUP)
+
+            if not auth_plugin:
+                # NOTE(jamielennox): Loading AuthTokenPlugin here should be
+                # exactly the same as calling
+                # _AuthTokenPlugin.load_from_conf_options(CONF, GROUP) however
+                # we can't do that because we have to use _conf_get to support
+                # the paste.ini options.
+                auth_plugin = _AuthTokenPlugin.load_from_options(
+                    auth_host=self._conf_get('auth_host'),
+                    auth_port=int(self._conf_get('auth_port')),
+                    auth_protocol=self._conf_get('auth_protocol'),
+                    auth_admin_prefix=self._conf_get('auth_admin_prefix'),
+                    admin_user=self._conf_get('admin_user'),
+                    admin_password=self._conf_get('admin_password'),
+                    admin_tenant_name=self._conf_get('admin_tenant_name'),
+                    admin_token=self._conf_get('admin_token'),
+                    identity_uri=self._conf_get('identity_uri'),
+                    log=self._LOG)
 
             adap = adapter.Adapter(
                 sess,
