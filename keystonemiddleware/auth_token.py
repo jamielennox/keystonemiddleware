@@ -549,6 +549,7 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
                                        tenant_name=admin_tenant_name)
 
         self._LOG = log
+        self._discovery = None
 
     def get_token(self, *args, **kwargs):
         return self._plugin.get_token(*args, **kwargs)
@@ -557,16 +558,21 @@ class _AuthTokenPlugin(auth.BaseAuthPlugin):
         if interface == auth.AUTH_INTERFACE:
             return self._identity_uri
 
-        url = self._identity_uri
+        if not self._discovery:
+            self._discovery = discover.Discover(session,
+                                                auth_url=self._identity_uri,
+                                                authenticated=False)
 
-        if version and version[0] == 2:
-            url += '/v2.0'
-        elif version and version[0] == 3:
-            url += '/v3'
-        else:
-            raise exceptions.EndpointNotFound()
+        if version:
+            if not self._discovery.url_for(version):
+                return None
 
-        return url
+            if version == 'v2.0' or version[0] == 2:
+                return '%s/v2.0' % self._identity_uri
+            elif version == 'v3.0' or version[0] == 3:
+                return '%s/v3' % self._identity_uri
+
+        raise exceptions.EndpointNotFound()
 
     def invalidate(self):
         return self._plugin.invalidate()
@@ -1514,20 +1520,24 @@ class _IdentityServer(object):
                            self._req_auth_version)
             return self._req_auth_version
 
-        auth_url = self._adapter.get_endpoint(interface=auth.AUTH_INTERFACE)
-        disc = discover.Discover(self._adapter,
-                                 auth_url=auth_url + '/',
-                                 authenticated=False)
+        version = None
 
-        for version in _LIST_OF_VERSIONS_TO_ATTEMPT:
-            if disc.url_for(version):
-                self._LOG.info('Auth Token confirmed use of %s apis',
-                               version)
-                return version
+        try:
+            if self._adapter.get_endpoint(version=(3, 0)):
+                version = 'v3.0'
+        except exceptions.EndpointNotFound:
+            pass
 
-        self._LOG.error('Attempted versions [%s] not supported by server',
-                        ', '.join(_LIST_OF_VERSIONS_TO_ATTEMPT))
-        raise ServiceError('No compatible apis supported by server')
+        try:
+            if not version and self._adapter.get_endpoint(version=(2, 0)):
+                version = 'v2.0'
+        except exceptions.EndpointNotFound:
+            pass
+
+        if not version:
+            raise ServiceError('Unable to get version info from keystone')
+
+        return version
 
     def _json_request(self, method, path, **kwargs):
         """HTTP request helper used to make json requests.
