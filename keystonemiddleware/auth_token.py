@@ -822,28 +822,88 @@ class _UserAuthPlugin(base_identity.BaseIdentityPlugin):
         # ensure that this function is only called on the first access.
         return self._user_auth_ref
 
+_LOG = logging.getLogger(__name__)
 
-class AuthProtocol(object):
-    """Middleware that handles authenticating client calls."""
 
-    def __init__(self, app, conf):
-        self._LOG = logging.getLogger(conf.get('log_name', __name__))
-        self._LOG.info(_LI('Starting Keystone auth_token middleware'))
-        # NOTE(wanghong): If options are set in paste file, all the option
-        # values passed into conf are string type. So, we should convert the
-        # conf value into correct type.
-        self._conf = _conf_values_type_convert(conf)
+class _AuthToken(object):
+
+    _CACHE_VARS = {'token_cache_time': 300,
+                   'hash_algorithms': ['md5'],
+                   'cache': None,
+                   'memcached_servers': None,
+                   'memcache_use_advanced_pool': False,
+                   'memcache_pool_dead_retry': 300,
+                   'memcache_pool_maxsize': 10,
+                   'memcache_pool_unused_timeout': 60,
+                   'memcache_pool_conn_get_timeout': 10,
+                   'memcache_pool_socket_timeout': 3}
+
+    def __init__(self, app, session, **kwargs):
         self._app = app
 
-        # delay_auth_decision means we still allow unauthenticated requests
-        # through and we let the downstream service make the final decision
-        self._delay_auth_decision = self._conf_get('delay_auth_decision')
-        self._include_service_catalog = self._conf_get(
-            'include_service_catalog')
+        self._LOG = kwargs.pop('log', _LOG)
+        self._LOG.info(_LI('Starting Keystone auth_token middleware'))
 
-        self._identity_server = self._create_identity_server()
+        self._delay_auth_decision = kwargs.pop('delay_auth_decision', False)
+        self._include_service_catalog = kwargs.pop('include_service_catalog',
+                                                   True)
+        self._enforce_token_bind = kwargs.pop('enforce_token_bind',
+                                              _BIND_MODE.PERMISSIVE)
 
-        self._auth_uri = self._conf_get('auth_uri')
+        self._auth_uri = kwargs.pop('auth_uri', None)
+
+        self._signing_dirname = kwargs.pop('signing_dir', None)
+        if self._signing_dirname is None:
+            prefix = 'keystone-signing-'
+            self._signing_dirname = tempfile.mkdtemp(prefix=prefix)
+
+        msg = _LI('Using %s as cache directory for signing certificate')
+        self._LOG.info(msg, self._signing_dirname)
+        self._verify_signing_dir()
+
+        val = '%s/signing_cert.pem' % self._signing_dirname
+        self._signing_cert_file_name = val
+        val = '%s/cacert.pem' % self._signing_dirname
+        self._signing_ca_file_name = val
+        val = '%s/revoked.pem' % self._signing_dirname
+        self._revoked_file_name = val
+
+        security_strategy = kwargs.pop('memcache_security_strategy', None)
+        memcache_secret_key = kwargs.pop('memcache_secret_key', None)
+        cache_kwargs = dict((k, kwargs.pop(k, v))
+                            for k, v in six.iteritems(self._CACHE_VARS))
+
+        if security_strategy:
+            self._token_cache = _SecureTokenCache(self._LOG,
+                                                  security_strategy,
+                                                  memcache_secret_key,
+                                                  **cache_kwargs)
+        else:
+            self._token_cache = _TokenCache(self._LOG, **cache_kwargs)
+
+        self._token_revocation_list_prop = None
+        self._token_revocation_list_fetched_time_prop = None
+        self._token_revocation_list_cache_timeout = datetime.timedelta(
+            seconds=kwargs.pop('revocation_cache_time', 10))
+
+        self._check_revocations_for_cached = kwargs.pop(
+            'check_revocations_for_cached', False)
+
+        auth_version = kwargs.pop('auth_version', None)
+        if auth_version is not None:
+            auth_version = discover.normalize_version_number(auth_version)
+
+        kwargs.setdefault('user_agent', 'keystonemiddleware')
+        kwargs.setdefault('service_type', 'identity')
+        kwargs.setdefault('interface', 'admin')
+        adap = adapter.Adapter(session, **kwargs)
+
+        self._identity_server = _IdentityServer(
+            self._LOG,
+            adap,
+            include_service_catalog=self._include_service_catalog,
+            requested_auth_version=auth_version)
+
         if not self._auth_uri:
             self._LOG.warning(
                 _LW('Configuring auth_uri to point to the public identity '
@@ -855,39 +915,7 @@ class AuthProtocol(object):
 
             self._auth_uri = self._identity_server.auth_uri
 
-        # signing
-        self._signing_dirname = self._conf_get('signing_dir')
-        if self._signing_dirname is None:
-            self._signing_dirname = tempfile.mkdtemp(
-                prefix='keystone-signing-')
-        self._LOG.info(
-            _LI('Using %s as cache directory for signing certificate'),
-            self._signing_dirname)
-        self._verify_signing_dir()
-
-        val = '%s/signing_cert.pem' % self._signing_dirname
-        self._signing_cert_file_name = val
-        val = '%s/cacert.pem' % self._signing_dirname
-        self._signing_ca_file_name = val
-        val = '%s/revoked.pem' % self._signing_dirname
-        self._revoked_file_name = val
-
-        self._token_cache = self._token_cache_factory()
-        self._token_revocation_list_prop = None
-        self._token_revocation_list_fetched_time_prop = None
-        self._token_revocation_list_cache_timeout = datetime.timedelta(
-            seconds=self._conf_get('revocation_cache_time'))
-
-        self._check_revocations_for_cached = self._conf_get(
-            'check_revocations_for_cached')
         self._init_auth_headers()
-
-    def _conf_get(self, name):
-        # try config from paste-deploy first
-        if name in self._conf:
-            return self._conf[name]
-        else:
-            return CONF.keystone_authtoken[name]
 
     def _call_app(self, env, start_response):
         # NOTE(jamielennox): We wrap the given start response so that if an
@@ -1237,9 +1265,7 @@ class AuthProtocol(object):
         raise InvalidToken(msg)
 
     def _confirm_token_bind(self, data, env):
-        bind_mode = self._conf_get('enforce_token_bind')
-
-        if bind_mode == _BIND_MODE.DISABLED:
+        if self._enforce_token_bind == _BIND_MODE.DISABLED:
             return
 
         try:
@@ -1253,7 +1279,8 @@ class AuthProtocol(object):
             bind = {}
 
         # permissive and strict modes don't require there to be a bind
-        permissive = bind_mode in (_BIND_MODE.PERMISSIVE, _BIND_MODE.STRICT)
+        permissive = self._enforce_token_bind in (_BIND_MODE.PERMISSIVE,
+                                                  _BIND_MODE.STRICT)
 
         if not bind:
             if permissive:
@@ -1264,10 +1291,10 @@ class AuthProtocol(object):
                 self._invalid_user_token()
 
         # get the named mode if bind_mode is not one of the predefined
-        if permissive or bind_mode == _BIND_MODE.REQUIRED:
+        if permissive or self._enforce_token_bind == _BIND_MODE.REQUIRED:
             name = None
         else:
-            name = bind_mode
+            name = self._enforce_token_bind
 
         if name and name not in bind:
             self._LOG.info(_LI('Named bind mode %s not in bind information'),
@@ -1288,7 +1315,7 @@ class AuthProtocol(object):
 
                 self._LOG.debug('Kerberos bind authentication successful.')
 
-            elif bind_mode == _BIND_MODE.PERMISSIVE:
+            elif self._enforce_token_bind == _BIND_MODE.PERMISSIVE:
                 self._LOG.debug('Ignoring Unknown bind for permissive mode: '
                                 '%(bind_type)s: %(identifier)s.',
                                 {'bind_type': bind_type,
@@ -1465,7 +1492,28 @@ class AuthProtocol(object):
             self._signing_ca_file_name,
             self._identity_server.fetch_ca_cert())
 
-    def _create_identity_server(self):
+
+class AuthProtocol(_AuthToken):
+    """Middleware that handles authenticating client calls."""
+
+    _PASS_THROUGH_VARS = _AuthToken._CACHE_VARS.keys() + [
+        'delay_auth_decision',
+        'include_service_catalog',
+        'auth_uri',
+        'auth_version',
+        'signing_dir',
+        'revocation_cache_time',
+        'check_revocations_for_cached',
+        'enforce_token_bind',
+        'memcache_security_strategy',
+        'memcache_secret_key']
+
+    def __init__(self, app, conf):
+        # NOTE(wanghong): If options are set in paste file, all the option
+        # values passed into conf are string type. So, we should convert the
+        # conf value into correct type.
+        self._conf = _conf_values_type_convert(conf)
+
         # NOTE(jamielennox): Loading Session here should be exactly the
         # same as calling Session.load_from_conf_options(CONF, GROUP)
         # however we can't do that because we have to use _conf_get to
@@ -1477,6 +1525,9 @@ class AuthProtocol(object):
             insecure=self._conf_get('insecure'),
             timeout=self._conf_get('http_connect_timeout')
         ))
+
+        log = logging.getLogger(conf.get('log_name', __name__))
+        kwargs = dict((c, self._conf_get(c)) for c in self._PASS_THROUGH_VARS)
 
         # NOTE(jamielennox): The original auth mechanism allowed deployers
         # to configure authentication information via paste file. These
@@ -1501,51 +1552,19 @@ class AuthProtocol(object):
                 admin_tenant_name=self._conf_get('admin_tenant_name'),
                 admin_token=self._conf_get('admin_token'),
                 identity_uri=self._conf_get('identity_uri'),
-                log=self._LOG)
+                log=log)
 
-        adap = adapter.Adapter(
-            sess,
-            auth=auth_plugin,
-            service_type='identity',
-            interface='admin',
-            connect_retries=self._conf_get('http_request_max_retries'))
+        kwargs['auth'] = auth_plugin
+        kwargs['connect_retries'] = self._conf_get('http_request_max_retries')
 
-        auth_version = self._conf_get('auth_version')
-        if auth_version is not None:
-            auth_version = discover.normalize_version_number(auth_version)
-        return _IdentityServer(
-            self._LOG,
-            adap,
-            include_service_catalog=self._include_service_catalog,
-            requested_auth_version=auth_version)
+        super(AuthProtocol, self).__init__(app, sess, log=log, **kwargs)
 
-    def _token_cache_factory(self):
-        security_strategy = self._conf_get('memcache_security_strategy')
-
-        cache_kwargs = dict(
-            cache_time=int(self._conf_get('token_cache_time')),
-            hash_algorithms=self._conf_get('hash_algorithms'),
-            env_cache_name=self._conf_get('cache'),
-            memcached_servers=self._conf_get('memcached_servers'),
-            use_advanced_pool=self._conf_get('memcache_use_advanced_pool'),
-            memcache_pool_dead_retry=self._conf_get(
-                'memcache_pool_dead_retry'),
-            memcache_pool_maxsize=self._conf_get('memcache_pool_maxsize'),
-            memcache_pool_unused_timeout=self._conf_get(
-                'memcache_pool_unused_timeout'),
-            memcache_pool_conn_get_timeout=self._conf_get(
-                'memcache_pool_conn_get_timeout'),
-            memcache_pool_socket_timeout=self._conf_get(
-                'memcache_pool_socket_timeout'),
-        )
-
-        if security_strategy:
-            return _SecureTokenCache(self._LOG,
-                                     security_strategy,
-                                     self._conf_get('memcache_secret_key'),
-                                     **cache_kwargs)
+    def _conf_get(self, name):
+        # try config from paste-deploy first
+        if name in self._conf:
+            return self._conf[name]
         else:
-            return _TokenCache(self._LOG, **cache_kwargs)
+            return CONF.keystone_authtoken[name]
 
 
 class _CachePool(list):
@@ -1844,18 +1863,19 @@ class _TokenCache(object):
     _CACHE_KEY_TEMPLATE = 'tokens/%s'
     _INVALID_INDICATOR = 'invalid'
 
-    def __init__(self, log, cache_time=None, hash_algorithms=None,
-                 env_cache_name=None, memcached_servers=None,
-                 use_advanced_pool=False, memcache_pool_dead_retry=None,
+    def __init__(self, log, token_cache_time=None, hash_algorithms=None,
+                 cache=None, memcached_servers=None,
+                 memcache_use_advanced_pool=False,
+                 memcache_pool_dead_retry=None,
                  memcache_pool_maxsize=None, memcache_pool_unused_timeout=None,
                  memcache_pool_conn_get_timeout=None,
                  memcache_pool_socket_timeout=None):
         self._LOG = log
-        self._cache_time = cache_time
+        self._cache_time = token_cache_time
         self._hash_algorithms = hash_algorithms
-        self._env_cache_name = env_cache_name
+        self._env_cache_name = cache
         self._memcached_servers = memcached_servers
-        self._use_advanced_pool = use_advanced_pool
+        self._use_advanced_pool = memcache_use_advanced_pool
         self._memcache_pool_dead_retry = memcache_pool_dead_retry,
         self._memcache_pool_maxsize = memcache_pool_maxsize,
         self._memcache_pool_unused_timeout = memcache_pool_unused_timeout

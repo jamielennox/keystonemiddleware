@@ -2550,9 +2550,8 @@ class OtherTests(BaseAuthTokenMiddlewareTest):
 
     def _assert_auth_version(self, conf_version, identity_server_version):
         self.set_middleware(conf={'auth_version': conf_version})
-        identity_server = self.middleware._create_identity_server()
         self.assertEqual(identity_server_version,
-                         identity_server.auth_version)
+                         self.middleware._identity_server.auth_version)
 
     def test_micro_version(self):
         self._assert_auth_version('v2', (2, 0))
