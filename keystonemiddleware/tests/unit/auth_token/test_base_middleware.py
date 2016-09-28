@@ -36,7 +36,7 @@ class FetchingMiddleware(auth_token.BaseAuthProtocol):
         super(FetchingMiddleware, self).__init__(app, **kwargs)
         self.token_dict = token_dict
 
-    def fetch_token(self, token):
+    def fetch_token(self, token, **kwargs):
         try:
             return self.token_dict[token]
         except KeyError:
