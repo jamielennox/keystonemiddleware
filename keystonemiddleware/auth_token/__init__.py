@@ -341,20 +341,7 @@ class BaseAuthProtocol(object):
         """
         user_auth_ref = None
         serv_auth_ref = None
-
-        if request.user_token:
-            self.log.debug('Authenticating user token')
-            try:
-                data, user_auth_ref = self._do_fetch_token(request.user_token)
-                self._validate_token(user_auth_ref)
-                if not request.service_token:
-                    self._confirm_token_bind(user_auth_ref, request)
-            except ksm_exceptions.InvalidToken:
-                self.log.info(_LI('Invalid user token'))
-                request.user_token_valid = False
-            else:
-                request.user_token_valid = True
-                request.token_info = data
+        allow_expired = False
 
         if request.service_token:
             self.log.debug('Authenticating service token')
@@ -367,11 +354,29 @@ class BaseAuthProtocol(object):
                 request.service_token_valid = False
             else:
                 request.service_token_valid = True
+                allow_expired = True
+
+        if request.user_token:
+            self.log.debug('Authenticating user token')
+            try:
+                data, user_auth_ref = self._do_fetch_token(
+                    request.user_token,
+                    allow_expired=allow_expired)
+                self._validate_token(user_auth_ref,
+                                     allow_expired=allow_expired)
+                if not request.service_token:
+                    self._confirm_token_bind(user_auth_ref, request)
+            except ksm_exceptions.InvalidToken:
+                self.log.info(_LI('Invalid user token'))
+                request.user_token_valid = False
+            else:
+                request.user_token_valid = True
+                request.token_info = data
 
         request.token_auth = _user_plugin.UserAuthPlugin(user_auth_ref,
                                                          serv_auth_ref)
 
-    def _validate_token(self, auth_ref):
+    def _validate_token(self, auth_ref, allow_expired=False):
         """Perform the validation steps on the token.
 
         :param auth_ref: The token data
@@ -379,8 +384,12 @@ class BaseAuthProtocol(object):
 
         :raises exc.InvalidToken: if token is rejected
         """
+        # guess at 8 hours if we allow expired, might want infinite
+        # negative provides beyond expiry rather than minimum required window
+        window = -8 * 60 * 60 if allow_expired else 0
+
         # 0 seconds of validity means it is invalid right now
-        if auth_ref.will_expire_soon(stale_duration=0):
+        if auth_ref.will_expire_soon(stale_duration=window):
             raise ksm_exceptions.InvalidToken(_('Token authorization failed'))
 
     def _do_fetch_token(self, token, **kwargs):
@@ -650,7 +659,7 @@ class AuthProtocol(BaseAuthProtocol):
             if cached:
                 return cached
 
-    def fetch_token(self, token):
+    def fetch_token(self, token, allow_expired=False):
         """Retrieve a token from either a PKI bundle or the identity server.
 
         :param str token: token id
@@ -685,7 +694,9 @@ class AuthProtocol(BaseAuthProtocol):
             else:
                 data = self._validate_offline(token, token_hashes)
                 if not data:
-                    data = self._identity_server.verify_token(token)
+                    data = self._identity_server.verify_token(
+                        token,
+                        allow_expired=allow_expired)
 
                 self._token_cache.set(token_hashes[0], data)
 
@@ -741,8 +752,8 @@ class AuthProtocol(BaseAuthProtocol):
 
             return data
 
-    def _validate_token(self, auth_ref):
-        super(AuthProtocol, self)._validate_token(auth_ref)
+    def _validate_token(self, auth_ref, **kwargs):
+        super(AuthProtocol, self)._validate_token(auth_ref, **kwargs)
 
         if auth_ref.version == 'v2.0' and not auth_ref.project_id:
             msg = _('Unable to determine service tenancy.')
